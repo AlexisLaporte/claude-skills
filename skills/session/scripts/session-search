@@ -1,0 +1,84 @@
+#!/bin/bash
+
+# Fast Claude conversation finder
+# Usage: session-search [keyword] [--global] [--from YYYY-MM-DD] [--to YYYY-MM-DD] [-n N]
+
+CLAUDE_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+PROJECTS_DIR="$CLAUDE_DIR/projects"
+
+[ ! -d "$PROJECTS_DIR" ] && echo "No Claude projects directory at $PROJECTS_DIR" && exit 1
+
+KEYWORD=""
+FILTER_GLOBAL=false
+FROM_DATE=""
+TO_DATE=""
+LIMIT=5
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --global) FILTER_GLOBAL=true; shift ;;
+        --from) FROM_DATE="$2"; shift 2 ;;
+        --to) TO_DATE="$2"; shift 2 ;;
+        -n) LIMIT="$2"; shift 2 ;;
+        --help|-h)
+            echo "Usage: session-search [keyword] [options]"
+            echo "  --global        Search all projects (default: current project)"
+            echo "  --from DATE     Filter from date (YYYY-MM-DD)"
+            echo "  --to DATE       Filter to date (YYYY-MM-DD)"
+            echo "  -n N            Max results (default: 15)"
+            exit 0 ;;
+        *) KEYWORD="$1"; shift ;;
+    esac
+done
+
+# Determine search directory
+if [ "$FILTER_GLOBAL" = true ]; then
+    SEARCH_DIR="$PROJECTS_DIR"
+else
+    SLUG=$(pwd | sed 's|/|-|g')
+    SEARCH_DIR="$PROJECTS_DIR/$SLUG"
+    [ ! -d "$SEARCH_DIR" ] && echo "No conversations for current project" && exit 0
+fi
+
+# Step 1: List all jsonl files sorted by mtime (most recent first) — cheap
+SORTED=$(find "$SEARCH_DIR" -name "*.jsonl" -type f -size +0 ! -name "agent-*" -printf '%T@ %p\n' 2>/dev/null \
+    | grep -v '/subagents/' | sort -rn)
+
+[ -z "$SORTED" ] && echo "No conversations found" && exit 0
+
+# Step 2: Apply date filters on mtime (before searching content)
+if [ -n "$FROM_DATE" ]; then
+    FROM_EPOCH=$(date -d "$FROM_DATE" +%s 2>/dev/null)
+    [ -n "$FROM_EPOCH" ] && SORTED=$(echo "$SORTED" | awk -v t="$FROM_EPOCH" '$1 >= t')
+fi
+if [ -n "$TO_DATE" ]; then
+    TO_EPOCH=$(date -d "$TO_DATE +1 day" +%s 2>/dev/null)
+    [ -n "$TO_EPOCH" ] && SORTED=$(echo "$SORTED" | awk -v t="$TO_EPOCH" '$1 < t')
+fi
+
+# Step 3: Iterate most recent first, grep keyword, stop at LIMIT
+count=0
+while IFS=' ' read -r mtime filepath; do
+    [ -z "$filepath" ] && continue
+
+    # Keyword filter: skip files that don't match
+    if [ -n "$KEYWORD" ]; then
+        grep -qi "$KEYWORD" "$filepath" 2>/dev/null || continue
+    fi
+
+    session_id=$(basename "$filepath" .jsonl)
+    date_str=$(date -d "@${mtime%%.*}" "+%Y-%m-%d %H:%M" 2>/dev/null)
+    project_path=$(head -1 "$filepath" 2>/dev/null | jq -r '.cwd // ""' 2>/dev/null)
+    preview=$(grep -m1 '"type":"user"' "$filepath" 2>/dev/null | jq -r '.message.content // ""' 2>/dev/null | tr '\n\t' '  ' | cut -c1-80)
+    msg_count=$(grep -c '"type":"user"' "$filepath" 2>/dev/null)
+
+    count=$((count + 1))
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "$count. [$date_str] ${project_path:-?} ($msg_count msgs)"
+    [ -n "$preview" ] && echo "   💬 $preview"
+    echo "   ▶ claude --resume $session_id"
+
+    [ "$count" -ge "$LIMIT" ] && break
+done <<< "$SORTED"
+
+[ "$count" -gt 0 ] && echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" || echo "No conversations found"
